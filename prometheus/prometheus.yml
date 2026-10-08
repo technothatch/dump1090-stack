@@ -1,0 +1,35 @@
+# Prometheus configuration for dump1090-stack.
+#
+# Mounted read-only at /etc/prometheus/prometheus.yml; alert rules live in
+# alerts.yml (mounted alongside it) and are pulled in via rule_files below.
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  evaluation_interval: 15s
+  external_labels:
+    stack: dump1090-stack
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  - job_name: dump1090-exporter
+    metrics_path: /metrics
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - dump1090-exporter:9702
+        labels:
+          decoder: readsb
+
+  - job_name: prometheus
+    static_configs:
+      - targets:
+          - localhost:9090

@@ -1,0 +1,205 @@
+# dump1090-stack - Docker Compose stack for the dump1090 / readsb ADS-B
+# decoder ecosystem: decoder + tar1090 web UI + Prometheus + Grafana +
+# Alertmanager, with an optional raw-traffic recorder profile.
+#
+#   readsb --> ./data/readsb/*.json --> tar1090 (nginx, /data) --> dump1090-exporter
+#                                                                       |
+#                                     Alertmanager <-- Prometheus <------
+#                                             |
+#                                        webhook receiver
+#
+# Every variable used below is documented in .env.example - copy it first:
+#   cp .env.example .env
+
+name: dump1090-stack
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  readsb:
+    image: ${READSB_IMAGE:-ghcr.io/wiedehopf/readsb:latest}
+    container_name: readsb
+    restart: unless-stopped
+    # Host networking is deliberate: the decoder publishes the classic
+    # dump1090 TCP ports (30001-30005 plus the 8042 HTTP API) straight on
+    # the host, so feeders, mlat clients and viewadsb connect exactly as
+    # they would on a bare-metal install - and USB/RTL-SDR pass-through
+    # stays a plain device/privileged grant (see below).
+    network_mode: host
+    # RTL-SDR pass-through - any one of these shapes grants /dev/bus/usb:
+    #   privileged: ${READSB_PRIVILEGED}                (what this file uses)
+    #   devices:    ["/dev/bus/usb:/dev/bus/usb"]
+    #   volumes:    ["/dev/bus/usb:/dev/bus/usb"]  (with privileged or a
+    #               device_cgroup_rules entry for char major 189)
+    # Docker Desktop (macOS/Windows) cannot pass USB through at all: set
+    # READSB_PRIVILEGED=false and use the --net-only remote feed mode
+    # documented in README.md.
+    privileged: ${READSB_PRIVILEGED:-true}
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${READSB_DATA_DIR:-./data/readsb}:/run/readsb
+    command: >-
+      --write-json=/run/readsb
+      --write-json-every=1
+      --json-location-accuracy=2
+      --net
+      --net-ri-port=30001
+      --net-ro-port=30002
+      --net-sbs-port=30003
+      --net-bi-port=30004
+      --net-bo-port=30005
+      --net-api-port=${READSB_API_PORT:-8042}
+      --device-type=${READSB_DEVICE_TYPE:-rtlsdr}
+      ${READSB_ARGS:-}
+    logging: *default-logging
+
+  tar1090:
+    build:
+      context: ./tar1090
+    image: dump1090-stack-tar1090:local
+    container_name: tar1090
+    restart: unless-stopped
+    # nginx serves the tar1090 single-page UI and proxies nothing: the
+    # decoder JSON directory is bind-mounted read-only at /data.
+    ports:
+      - "${TAR1090_PORT:-8080}:80"
+    environment:
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ${READSB_DATA_DIR:-./data/readsb}:/data:ro
+    depends_on:
+      - readsb
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:80/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  dump1090-exporter:
+    build:
+      context: ./dump1090-exporter
+    image: dump1090-stack-exporter:local
+    container_name: dump1090-exporter
+    restart: unless-stopped
+    # The exporter scrapes /data/*.json over HTTP; tar1090's nginx is the
+    # only HTTP surface in the stack, so point it there.
+    environment:
+      TZ: ${TZ:-UTC}
+      DUMP1090_URL: ${DUMP1090_URL:-http://tar1090}
+    command:
+      - --web.listen-address=:9702
+    depends_on:
+      - tar1090
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9702/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  prometheus:
+    image: prom/prometheus:v3.15.0
+    container_name: prometheus
+    restart: unless-stopped
+    # Metrics stay on loopback; reach the UI with
+    #   ssh -L 9090:localhost:9090 host
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+    depends_on:
+      - dump1090-exporter
+      - alertmanager
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:9090/-/healthy || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging: *default-logging
+
+  grafana:
+    image: grafana/grafana-oss:13.0.2
+    container_name: grafana
+    restart: unless-stopped
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    environment:
+      TZ: ${TZ:-UTC}
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-changeme}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *default-logging
+
+  alertmanager:
+    image: prom/alertmanager:v0.34.1
+    container_name: alertmanager
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${ALERTMANAGER_PORT:-9093}:9093"
+    volumes:
+      - ./alertmanager/config.yml:/etc/alertmanager/config.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/config.yml
+      - --storage.path=/alertmanager
+    # Lets the example webhook in alertmanager/config.yml reach a service
+    # running on the Docker host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    logging: *default-logging
+
+  recorder:
+    profiles: ["recorder"]
+    build:
+      context: ./recorder
+    image: dump1090-stack-recorder:local
+    container_name: dump1090-recorder
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-UTC}
+      BEAST_HOST: ${RECORD_HOST:-host.docker.internal}
+      BEAST_PORT: ${RECORD_PORT:-30005}
+      RECORD_INTERVAL: ${RECORD_INTERVAL:-900}
+    volumes:
+      - ${RECORD_DATA_DIR:-./recordings}:/recordings
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      - readsb
+    logging: *default-logging
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

@@ -1,0 +1,57 @@
+# Alert rules for dump1090-stack.
+#
+# Every metric referenced here is emitted by dump1090-exporter; the exact
+# verified list lives in src/dump1090_stack/metrics.py (checked against
+# dump1090-exporter/internal/exporter/exporter.go) and tests/test_stack.py
+# fails if a rule ever drifts away from it.
+
+groups:
+  - name: dump1090-stack
+    interval: 30s
+    rules:
+      - alert: DecoderDown
+        expr: dump1090_up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Decoder is unreachable"
+          description: >-
+            dump1090-exporter has failed to read /data/aircraft.json for
+            2 minutes: the readsb container is stopped, restarting or
+            writing to a different directory.
+
+      - alert: MessageRateLow
+        expr: dump1090_messages_per_second < 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Message rate below 1 msg/s"
+          description: >-
+            The decoder has been producing less than 1 message per second
+            for 15 minutes (antenna, gain, dongle or dongle-driver problem).
+
+      - alert: HighBlocksDropped
+        expr: increase(dump1090_blocks_dropped_total[15m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Demodulator is dropping sample blocks"
+          description: >-
+            More than 100 sample blocks were dropped in 15 minutes. USB or
+            CPU is saturated: move the dongle to another bus, lower the
+            sample rate or reduce CPU load.
+
+      - alert: NoAircraft
+        expr: dump1090_aircraft == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No aircraft tracked"
+          description: >-
+            aircraft.json has contained zero aircraft for 30 minutes.
+            Check the antenna, the gain and whether there is really no
+            traffic in range.

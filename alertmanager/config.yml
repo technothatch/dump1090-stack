@@ -1,0 +1,39 @@
+# Alertmanager configuration for dump1090-stack.
+#
+# The receiver below is a plain webhook: it POSTs the Alertmanager JSON
+# payload to any HTTP endpoint that accepts it (a dump1090-alerts webhook
+# sink, ntfy with the JSON format, Grafana, a reverse proxy, ...).
+# Point url: at your endpoint before starting the stack.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: webhook
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 12h
+  routes:
+    # Critical alerts page immediately instead of waiting for the group.
+    - receiver: webhook
+      matchers:
+        - severity="critical"
+      group_wait: 10s
+      repeat_interval: 2h
+
+receivers:
+  - name: webhook
+    webhook_configs:
+      # host.docker.internal resolves to the Docker host (extra_hosts in
+      # compose.yaml), so a receiver running on the host is reachable here.
+      - url: http://host.docker.internal:9099/alerts
+        send_resolved: true
+
+inhibit_rules:
+  # A critical DecoderDown silences the warning-level noise it causes.
+  - source_matchers:
+      - severity="critical"
+    target_matchers:
+      - severity="warning"
+    equal: [alertname, instance]

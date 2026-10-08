@@ -1,0 +1,17 @@
+# Grafana dashboard provisioning for dump1090-stack.
+#
+# The directory mounted here must match options.path below; compose.yaml
+# bind-mounts ./grafana/dashboards at /var/lib/grafana/dashboards.
+apiVersion: 1
+
+providers:
+  - name: dump1090-stack
+    orgId: 1
+    folder: ADS-B
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
